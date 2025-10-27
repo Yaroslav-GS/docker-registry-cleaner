@@ -222,32 +222,45 @@ def format_size(num_bytes):
     return f"{size:.2f} PB"
 
 
-def get_registry_disk_usage():
-    """Return the registry storage size in bytes, if available."""
-    # Query the registry container directly so we measure the actual storage backend.
-    cmd = ['docker', 'exec', REGISTRY_CONTAINER, 'du', '-sb', REGISTRY_STORAGE_PATH]
-
+def _run_du_command(cmd, context_label):
+    """Execute a du command and return the parsed byte size."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except Exception as exc:
-        LOGGER.warning("Failed to get registry disk usage: %s", exc)
-        print(f"Warning: failed to determine registry storage size: {exc}")
+        LOGGER.warning("Failed to get registry disk usage via %s: %s", context_label, exc)
+        print(f"Warning: failed to determine registry storage size via {context_label}: {exc}")
         return None
 
     output = result.stdout.strip()
 
     if not output:
-        LOGGER.warning("Disk usage command returned no output")
-        print("Warning: disk usage command returned no output")
+        LOGGER.warning("Disk usage command for %s returned no output", context_label)
+        print(f"Warning: disk usage command for {context_label} returned no output")
         return None
 
     try:
         size_str = output.split()[0]
         return int(size_str)
     except (IndexError, ValueError) as exc:
-        LOGGER.warning("Unexpected disk usage output '%s': %s", output, exc)
-        print(f"Warning: unexpected disk usage output '{output}'")
+        LOGGER.warning("Unexpected disk usage output for %s: '%s' (%s)", context_label, output, exc)
+        print(f"Warning: unexpected disk usage output for {context_label}: '{output}'")
         return None
+
+
+def get_registry_disk_usage():
+    """Return the registry storage size in bytes, if available."""
+    host_storage_path = PATHS_CONFIG.get('host_storage')
+    if host_storage_path and os.path.exists(host_storage_path):
+        size = _run_du_command(['du', '-sb', host_storage_path], host_storage_path)
+        if size is not None:
+            return size
+        LOGGER.info(
+            "Falling back to measuring storage through the registry container after host path failure"
+        )
+
+    # Query the registry container directly so we measure the actual storage backend.
+    cmd = ['docker', 'exec', REGISTRY_CONTAINER, 'du', '-sb', REGISTRY_STORAGE_PATH]
+    return _run_du_command(cmd, f"{REGISTRY_CONTAINER}:{REGISTRY_STORAGE_PATH}")
 
 def run_garbage_collection_docker(dry_run=False):
     """Run the registry garbage collector through docker exec."""

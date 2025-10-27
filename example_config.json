@@ -10,6 +10,8 @@
     "protected_tags": ["dev-latest", "prod-latest", "prod", "dev"]
   },
   "paths": {
-    "config": "/etc/distribution/config.yml"
+    "config": "/etc/distribution/config.yml",
+    "storage": "/var/lib/registry",
+    "host_storage": "/home/usrdev/registry"
   }
 }
