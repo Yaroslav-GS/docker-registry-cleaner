@@ -10,11 +10,11 @@ import sys
 import os
 
 def load_config(config_file='config.json'):
-    """Загружает конфигурацию из JSON файла"""
+    """Load configuration settings from a JSON file."""
     with open(config_file, 'r') as f:
         return json.load(f)
 
-# Загружаем конфигурацию
+# Load the configuration
 config = load_config()
 
 REGISTRY_URL = config['registry']['url']
@@ -74,27 +74,27 @@ def _log_print(*args, **kwargs):
 builtins.print = _log_print
 
 def get_auth():
-    """Возвращает кортеж для базовой аутентификации"""
+    """Return the basic-auth credentials tuple if available."""
     if REGISTRY_USER and REGISTRY_PASSWORD:
         return (REGISTRY_USER, REGISTRY_PASSWORD)
     return None
 
 def get_repositories():
-    """Получает список всех репозиториев"""
+    """Retrieve the list of all repositories."""
     url = f"{REGISTRY_URL}/v2/_catalog"
     response = requests.get(url, auth=get_auth())
     response.raise_for_status()
     return response.json().get('repositories', [])
 
 def get_tags(repository):
-    """Получает список тегов для репозитория"""
+    """Retrieve the list of tags for a repository."""
     url = f"{REGISTRY_URL}/v2/{repository}/tags/list"
     response = requests.get(url, auth=get_auth())
     response.raise_for_status()
     return response.json().get('tags', [])
 
 def get_image_created_date(repository, tag):
-    """Получает дату создания образа из config blob или манифеста"""
+    """Get the image creation date from the config blob or manifest."""
     try:
         url = f"{REGISTRY_URL}/v2/{repository}/manifests/{tag}"
         
@@ -125,7 +125,7 @@ def get_image_created_date(repository, tag):
         if manifest is None:
             return None, None
         
-        # Обработка списка манифестов (multi-arch)
+        # Handle manifest lists (multi-arch)
         if manifest.get('mediaType') in [
             'application/vnd.docker.distribution.manifest.list.v2+json',
             'application/vnd.oci.image.index.v1+json'
@@ -140,7 +140,7 @@ def get_image_created_date(repository, tag):
                 if response.status_code == 200:
                     manifest = response.json()
         
-        # Способ 1: Получаем дату из config blob
+        # Method 1: use the config blob for the date
         if 'config' in manifest:
             config_digest = manifest['config']['digest']
             config_url = f"{REGISTRY_URL}/v2/{repository}/blobs/{config_digest}"
@@ -152,13 +152,13 @@ def get_image_created_date(repository, tag):
                 if DEBUG:
                     print(f"    DEBUG: Config keys: {list(config.keys())}")
                 
-                # Проверяем разные поля с датой
+                # Check various fields that may contain the date
                 created_str = config.get('created')
                 if created_str:
                     created_date = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
                     return digest, created_date.replace(tzinfo=None)
                 
-                # Пробуем из history
+                # Fall back to history entries
                 if 'history' in config and len(config['history']) > 0:
                     for hist in config['history']:
                         if 'created' in hist:
@@ -166,7 +166,7 @@ def get_image_created_date(repository, tag):
                             created_date = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
                             return digest, created_date.replace(tzinfo=None)
         
-        # Способ 2: Используем Last-Modified из манифеста
+        # Method 2: fall back to Last-Modified on the manifest
         if response:
             last_modified = response.headers.get('Last-Modified')
             if last_modified:
@@ -175,7 +175,7 @@ def get_image_created_date(repository, tag):
                 date = parsedate_to_datetime(last_modified)
                 return digest, date.replace(tzinfo=None)
         
-        # Способ 3: Пробуем v1 compatibility
+        # Method 3: check v1 compatibility data
         if 'history' in manifest:
             for history_entry in manifest.get('history', []):
                 if 'v1Compatibility' in history_entry:
@@ -195,7 +195,7 @@ def get_image_created_date(repository, tag):
         return None, None
 
 def delete_tag(repository, digest):
-    """Удаляет тег по digest"""
+    """Delete a tag by its manifest digest."""
     url = f"{REGISTRY_URL}/v2/{repository}/manifests/{digest}"
     response = requests.delete(url, auth=get_auth())
     if response.status_code == 202:
@@ -222,35 +222,48 @@ def format_size(num_bytes):
     return f"{size:.2f} PB"
 
 
-def get_registry_disk_usage():
-    """Return the registry storage size in bytes, if available."""
-    # Query the registry container directly so we measure the actual storage backend.
-    cmd = ['docker', 'exec', REGISTRY_CONTAINER, 'du', '-sb', REGISTRY_STORAGE_PATH]
-
+def _run_du_command(cmd, context_label):
+    """Execute a du command and return the parsed byte size."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     except Exception as exc:
-        LOGGER.warning("Failed to get registry disk usage: %s", exc)
-        print(f"Warning: failed to determine registry storage size: {exc}")
+        LOGGER.warning("Failed to get registry disk usage via %s: %s", context_label, exc)
+        print(f"Warning: failed to determine registry storage size via {context_label}: {exc}")
         return None
 
     output = result.stdout.strip()
 
     if not output:
-        LOGGER.warning("Disk usage command returned no output")
-        print("Warning: disk usage command returned no output")
+        LOGGER.warning("Disk usage command for %s returned no output", context_label)
+        print(f"Warning: disk usage command for {context_label} returned no output")
         return None
 
     try:
         size_str = output.split()[0]
         return int(size_str)
     except (IndexError, ValueError) as exc:
-        LOGGER.warning("Unexpected disk usage output '%s': %s", output, exc)
-        print(f"Warning: unexpected disk usage output '{output}'")
+        LOGGER.warning("Unexpected disk usage output for %s: '%s' (%s)", context_label, output, exc)
+        print(f"Warning: unexpected disk usage output for {context_label}: '{output}'")
         return None
 
+
+def get_registry_disk_usage():
+    """Return the registry storage size in bytes, if available."""
+    host_storage_path = PATHS_CONFIG.get('host_storage')
+    if host_storage_path and os.path.exists(host_storage_path):
+        size = _run_du_command(['du', '-sb', host_storage_path], host_storage_path)
+        if size is not None:
+            return size
+        LOGGER.info(
+            "Falling back to measuring storage through the registry container after host path failure"
+        )
+
+    # Query the registry container directly so we measure the actual storage backend.
+    cmd = ['docker', 'exec', REGISTRY_CONTAINER, 'du', '-sb', REGISTRY_STORAGE_PATH]
+    return _run_du_command(cmd, f"{REGISTRY_CONTAINER}:{REGISTRY_STORAGE_PATH}")
+
 def run_garbage_collection_docker(dry_run=False):
-    """Запускает garbage collector через docker exec"""
+    """Run the registry garbage collector through docker exec."""
     cmd = ['docker', 'exec', REGISTRY_CONTAINER, 'registry', 'garbage-collect', 
            CONFIG_PATH, '--delete-untagged']
     if dry_run:
@@ -310,12 +323,12 @@ def main():
             print(f"  Found {len(tags)} tags")
             
             for tag in tags:
-                # Пропускаем защищенные теги
+                # Skip protected tags
                 if tag in PROTECTED_TAGS:
                     print(f"  ✓ Keeping protected tag: {tag}")
                     continue
                 
-                # Пропускаем специальные теги
+                # Skip special tags
                 if tag in ['buildcache', 'latest', 'cache']:
                     print(f"  ⊘ Skipping special tag: {tag}")
                     skipped_count += 1
@@ -333,7 +346,7 @@ def main():
                     skipped_count += 1
                     continue
                 
-                # Считаем возраст
+                # Calculate the age of the image
                 age_days = (datetime.now() - created_date).days
                 
                 if created_date < cutoff_date:
