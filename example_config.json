@@ -1,0 +1,15 @@
+{
+  "registry": {
+    "url": "http://127.0.0.1:5001",
+    "user": "someuser",
+    "password": "somepass",
+    "container": "registry"
+  },
+  "cleanup": {
+    "days_to_keep": 10,
+    "protected_tags": ["dev-latest", "prod-latest", "prod", "dev"]
+  },
+  "paths": {
+    "config": "/etc/distribution/config.yml"
+  }
+}
