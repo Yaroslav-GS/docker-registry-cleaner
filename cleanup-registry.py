@@ -23,6 +23,7 @@ REGISTRY_PASSWORD = config['registry']['password']
 REGISTRY_CONTAINER = config['registry']['container']
 DAYS_TO_KEEP = config['cleanup']['days_to_keep']
 PROTECTED_TAGS = config['cleanup']['protected_tags']
+PROTECTED_PATTERNS = config['cleanup'].get('protected_patterns', [])
 PATHS_CONFIG = config['paths']
 CONFIG_PATH = PATHS_CONFIG['config']
 REGISTRY_STORAGE_PATH = PATHS_CONFIG.get('storage', '/var/lib/registry')
@@ -202,7 +203,6 @@ def delete_tag(repository, digest):
         return True
     return False
 
-
 def format_size(num_bytes):
     """Convert a byte count into a human-readable string."""
     if num_bytes is None:
@@ -221,46 +221,82 @@ def format_size(num_bytes):
 
     return f"{size:.2f} PB"
 
-
-def _run_du_command(cmd, context_label):
-    """Execute a du command and return the parsed byte size."""
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except Exception as exc:
-        LOGGER.warning("Failed to get registry disk usage via %s: %s", context_label, exc)
-        print(f"Warning: failed to determine registry storage size via {context_label}: {exc}")
-        return None
-
-    output = result.stdout.strip()
-
-    if not output:
-        LOGGER.warning("Disk usage command for %s returned no output", context_label)
-        print(f"Warning: disk usage command for {context_label} returned no output")
-        return None
-
-    try:
-        size_str = output.split()[0]
-        return int(size_str)
-    except (IndexError, ValueError) as exc:
-        LOGGER.warning("Unexpected disk usage output for %s: '%s' (%s)", context_label, output, exc)
-        print(f"Warning: unexpected disk usage output for {context_label}: '{output}'")
-        return None
-
-
 def get_registry_disk_usage():
     """Return the registry storage size in bytes, if available."""
     host_storage_path = PATHS_CONFIG.get('host_storage')
     if host_storage_path and os.path.exists(host_storage_path):
-        size = _run_du_command(['du', '-sb', host_storage_path], host_storage_path)
-        if size is not None:
+        try:
+            result = subprocess.run(
+                ['du', '-sb', host_storage_path],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+            size_str = result.stdout.strip().split()[0]
+            size = int(size_str)
+            LOGGER.info(f"Registry storage size (host path): {format_size(size)}")
             return size
-        LOGGER.info(
-            "Falling back to measuring storage through the registry container after host path failure"
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, IndexError) as exc:
+            LOGGER.warning(f"Failed to get size via host path {host_storage_path}: {exc}")
+            if DEBUG:
+                print(f"  DEBUG: Host path measurement failed: {exc}")
+    
+    try:
+        check_cmd = ['docker', 'inspect', '-f', '{{.State.Running}}', REGISTRY_CONTAINER]
+        check_result = subprocess.run(
+            check_cmd,
+            capture_output=True,
+            text=True,
+            timeout=10
         )
+        
+        if check_result.returncode != 0:
+            LOGGER.error(f"Container {REGISTRY_CONTAINER} not found or not accessible")
+            print(f"Error: Container {REGISTRY_CONTAINER} not found")
+            return None
+        
+        is_running = check_result.stdout.strip()
+        if is_running != 'true':
+            LOGGER.error(f"Container {REGISTRY_CONTAINER} is not running")
+            print(f"Error: Container {REGISTRY_CONTAINER} is not running")
+            return None
+        
+        du_cmd = ['docker', 'exec', REGISTRY_CONTAINER, 'du', '-sb', REGISTRY_STORAGE_PATH]
+        result = subprocess.run(
+            du_cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60
+        )
+        
+        output = result.stdout.strip()
+        if not output:
+            LOGGER.warning("du command returned empty output")
+            return None
+        
+        size_str = output.split()[0]
+        size = int(size_str)
+        LOGGER.info(f"Registry storage size (container): {format_size(size)}")
+        return size
+        
+    except subprocess.TimeoutExpired:
+        LOGGER.error("Timeout while measuring registry storage size")
+        print("Error: Timeout while measuring storage size")
+        return None
+    except subprocess.CalledProcessError as exc:
+        LOGGER.error(f"Failed to execute du in container: {exc.stderr if exc.stderr else exc}")
+        print(f"Error: Failed to measure storage size")
+        return None
+    except (ValueError, IndexError) as exc:
+        LOGGER.error(f"Failed to parse du output: {exc}")
+        return None
+    except Exception as exc:
+        LOGGER.exception("Unexpected error measuring registry storage")
+        print(f"Error: {exc}")
+        return None
 
-    # Query the registry container directly so we measure the actual storage backend.
-    cmd = ['docker', 'exec', REGISTRY_CONTAINER, 'du', '-sb', REGISTRY_STORAGE_PATH]
-    return _run_du_command(cmd, f"{REGISTRY_CONTAINER}:{REGISTRY_STORAGE_PATH}")
 
 def run_garbage_collection_docker(dry_run=False):
     """Run the registry garbage collector through docker exec."""
@@ -298,6 +334,9 @@ def main():
     else:
         print()
 
+
+    deleted_count = 0
+    skipped_count = 0
     before_usage = get_registry_disk_usage()
     if before_usage is not None:
         print(f"Registry storage size before cleanup: {format_size(before_usage)} ({before_usage} bytes)")
@@ -305,8 +344,6 @@ def main():
         print("Registry storage size before cleanup: unavailable")
 
     cutoff_date = datetime.now() - timedelta(days=DAYS_TO_KEEP)
-    deleted_count = 0
-    skipped_count = 0
     
     try:
         repositories = get_repositories()
@@ -323,11 +360,17 @@ def main():
             print(f"  Found {len(tags)} tags")
             
             for tag in tags:
+                tag_lower = tag.lower()
+
                 # Skip protected tags
                 if tag in PROTECTED_TAGS:
                     print(f"  ✓ Keeping protected tag: {tag}")
                     continue
-                
+            
+                if any(pattern in tag_lower for pattern in PROTECTED_PATTERNS):
+                    print(f" ✓ Keeping protected tag: {tag} - pattern match")
+                    continue
+
                 # Skip special tags
                 if tag in ['buildcache', 'latest', 'cache']:
                     print(f"  ⊘ Skipping special tag: {tag}")
@@ -380,21 +423,42 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
-        # Always capture the post-cleanup storage footprint for visibility.
+        print(f"\n{'='*50}")
+        print("POST-CLEANUP STORAGE MEASUREMENT")
+        print(f"{'='*50}")
+        
+        if deleted_count > 0:
+            print("Waiting for filesystem sync...")
+            try:
+                subprocess.run(
+                    ['docker', 'exec', REGISTRY_CONTAINER, 'sync'],
+                    timeout=10,
+                    capture_output=True
+                )
+            except Exception:
+                pass
+        
         after_usage = get_registry_disk_usage()
+        
         if after_usage is not None:
             print(f"Registry storage size after cleanup: {format_size(after_usage)} ({after_usage} bytes)")
             if before_usage is not None:
                 diff = before_usage - after_usage
                 if diff > 0:
-                    print(f"Freed space: {format_size(diff)} ({diff} bytes)")
+                    percent = (diff / before_usage) * 100
+                    print(f"✓ Freed space: {format_size(diff)} ({diff} bytes, {percent:.2f}%)")
                 elif diff < 0:
                     diff_abs = abs(diff)
-                    print(f"Additional space used: {format_size(diff_abs)} ({diff_abs} bytes)")
+                    print(f"⚠ Storage increased: {format_size(diff_abs)} ({diff_abs} bytes)")
                 else:
-                    print("Freed space: 0 B (0 bytes)")
+                    print("No space freed (0 bytes)")
+            else:
+                print("Cannot calculate freed space (initial size unavailable)")
         else:
             print("Registry storage size after cleanup: unavailable")
+        
+        print(f"{'='*50}\n")
+
 
 if __name__ == '__main__':
     main()

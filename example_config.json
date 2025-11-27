@@ -6,12 +6,13 @@
     "container": "registry"
   },
   "cleanup": {
-    "days_to_keep": 10,
-    "protected_tags": ["dev-latest", "prod-latest", "prod", "dev"]
+    "days_to_keep": 30,
+    "protected_tags": ["dev-latest", "latest", "prod-stable", "dev-stable"],
+    "protected_patterns": ["develop", "master", "main", "release"]
   },
   "paths": {
     "config": "/etc/distribution/config.yml",
     "storage": "/var/lib/registry",
-    "host_storage": "/home/usrdev/registry"
+    "host_storage": "/some/path"
   }
 }
